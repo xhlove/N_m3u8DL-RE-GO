@@ -19,47 +19,43 @@ jobs:
         goos: [windows, linux, darwin]
         goarch: [amd64, arm64]
         exclude:
-          # darwin/arm64 build requires macOS runner
           - goos: darwin
             goarch: arm64
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-
       - name: Set up build variables
         id: vars
         run: |
-          echo "date=$(date -u -d '8 hours' +'%Y%m%d')" >> $GITHUB_OUTPUT
-          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "exe_name=${{ env.APP_NAME }}${{ matrix.goos == 'windows' && '.exe' || '' }}" >> $GITHUB_OUTPUT
-
+          DATE=$(date -u -d '8 hours' +'%Y%m%d')
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          FULL_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_${{ matrix.goos }}-${{ matrix.goarch }}_${DATE}_${SHA_SHORT}"
+          FULL_EXE_NAME="${FULL_NAME}${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          ARCHIVE_NAME="${{ env.APP_NAME }}_${{ matrix.goos }}-${{ matrix.goarch }}"
+          echo "full_exe_name=${FULL_EXE_NAME}" >> $GITHUB_OUTPUT
+          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
       - name: Build application
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          go build -v -trimpath -o "dist/${{ steps.vars.outputs.exe_name }}" .
-
+          go build -v -trimpath -o "dist/${{ steps.vars.outputs.full_exe_name }}" .
       - name: Package application
         id: package
         run: |
           cd dist
-          ASSET_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_${{ matrix.goos }}-${{ matrix.goarch }}_${{ steps.vars.outputs.date }}_${{ steps.vars.outputs.sha_short }}"
           if [ "${{ matrix.goos }}" == "windows" ]; then
-            zip "${ASSET_NAME}.zip" "${{ steps.vars.outputs.exe_name }}"
-            echo "asset_path=${ASSET_NAME}.zip" >> $GITHUB_OUTPUT
+            zip "${{ steps.vars.outputs.archive_name }}.zip" "${{ steps.vars.outputs.full_exe_name }}"
+            echo "asset_path=${{ steps.vars.outputs.archive_name }}.zip" >> $GITHUB_OUTPUT
           else
-            tar -czvf "${ASSET_NAME}.tar.gz" "${{ steps.vars.outputs.exe_name }}"
-            echo "asset_path=${ASSET_NAME}.tar.gz" >> $GITHUB_OUTPUT
+            tar -czvf "${{ steps.vars.outputs.archive_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
+            echo "asset_path=${{ steps.vars.outputs.archive_name }}.tar.gz" >> $GITHUB_OUTPUT
           fi
-          
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -69,7 +65,7 @@ jobs:
 
   build-macos-arm64:
     name: Build for darwin/arm64
-    runs-on: macos-latest # ARM64 build for macOS requires a macOS runner
+    runs-on: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -80,22 +76,25 @@ jobs:
       - name: Set up build variables
         id: vars
         run: |
-          echo "date=$(date -u -d '8 hours' +'%Y%m%d')" >> $GITHUB_OUTPUT
-          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          DATE=$(date -u -v+8H +'%Y%m%d')
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          FULL_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_darwin-arm64_${DATE}_${SHA_SHORT}"
+          ARCHIVE_NAME="${{ env.APP_NAME }}_darwin-arm64"
+          echo "full_exe_name=${FULL_NAME}" >> $GITHUB_OUTPUT
+          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
       - name: Build application
         env:
           GOOS: darwin
           GOARCH: arm64
           CGO_ENABLED: 0
         run: |
-          go build -v -trimpath -o "dist/${{ env.APP_NAME }}" .
+          go build -v -trimpath -o "dist/${{ steps.vars.outputs.full_exe_name }}" .
       - name: Package application
         id: package
         run: |
           cd dist
-          ASSET_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_darwin-arm64_${{ steps.vars.outputs.date }}_${{ steps.vars.outputs.sha_short }}"
-          tar -czvf "${ASSET_NAME}.tar.gz" "${{ env.APP_NAME }}"
-          echo "asset_path=${ASSET_NAME}.tar.gz" >> $GITHUB_OUTPUT
+          tar -czvf "${{ steps.vars.outputs.archive_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
+          echo "asset_path=${{ steps.vars.outputs.archive_name }}.tar.gz" >> $GITHUB_OUTPUT
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -109,52 +108,47 @@ jobs:
     strategy:
       matrix:
         goarch: [amd64, arm64]
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-
       - name: Set up Android NDK r25b
-        id: setup-ndk
         run: |
           wget https://dl.google.com/android/repository/android-ndk-r25b-linux.zip -O ndk.zip
           unzip -q ndk.zip
-          echo "ndk_path=$PWD/android-ndk-r25b" >> $GITHUB_OUTPUT
-
+          echo "NDK_HOME=$PWD/android-ndk-r25b" >> $GITHUB_ENV
       - name: Set up build variables
         id: vars
         run: |
-          echo "date=$(date -u -d '8 hours' +'%Y%m%d')" >> $GITHUB_OUTPUT
-          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          DATE=$(date -u -d '8 hours' +'%Y%m%d')
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          FULL_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_android-${{ matrix.goarch }}_${DATE}_${SHA_SHORT}"
+          ARCHIVE_NAME="${{ env.APP_NAME }}_android-${{ matrix.goarch }}"
+          echo "full_exe_name=${FULL_NAME}" >> $GITHUB_OUTPUT
+          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
           if [ "${{ matrix.goarch }}" == "arm64" ]; then
-            echo "toolchain_prefix=aarch64-linux-android"
+            TOOLCHAIN_PREFIX="aarch64-linux-android"
           else
-            echo "toolchain_prefix=x86_64-linux-android"
+            TOOLCHAIN_PREFIX="x86_64-linux-android"
           fi
-
+          echo "CC=${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${TOOLCHAIN_PREFIX}29-clang" >> $GITHUB_ENV
+          echo "CXX=${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${TOOLCHAIN_PREFIX}29-clang++" >> $GITHUB_ENV
       - name: Build application
         env:
           GOOS: android
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 1
-          CC: ${{ steps.setup-ndk.outputs.ndk_path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ steps.vars.outputs.toolchain_prefix }}24-clang
-          CXX: ${{ steps.setup-ndk.outputs.ndk_path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ steps.vars.outputs.toolchain_prefix }}24-clang++
         run: |
-          go build -v -trimpath -o "dist/${{ env.APP_NAME }}" .
-
+          go build -v -trimpath -ldflags "-w -s -extldflags '-Wl,--hash-style=sysv'" -o "dist/${{ steps.vars.outputs.full_exe_name }}" .
       - name: Package application
         id: package
         run: |
           cd dist
-          ASSET_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_android-${{ matrix.goarch }}_${{ steps.vars.outputs.date }}_${{ steps.vars.outputs.sha_short }}"
-          tar -czvf "${ASSET_NAME}.tar.gz" "${{ env.APP_NAME }}"
-          echo "asset_path=${ASSET_NAME}.tar.gz" >> $GITHUB_OUTPUT
-
+          tar -czvf "${{ steps.vars.outputs.archive_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
+          echo "asset_path=${{ steps.vars.outputs.archive_name }}.tar.gz" >> $GITHUB_OUTPUT
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
