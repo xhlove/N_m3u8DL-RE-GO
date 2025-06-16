@@ -17,7 +17,6 @@ type DownloadManager struct {
 	config           *ManagerConfig
 	selectedStreams  []*entity.StreamSpec
 	outputFiles      []*OutputFile
-	speedContainers  map[int]*util.SpeedContainer
 	mu               sync.RWMutex
 	mergeWaitGroup   sync.WaitGroup
 	fileDictionaries map[*entity.StreamSpec]map[int]string
@@ -94,7 +93,7 @@ func NewDownloadManager(config *ManagerConfig, streams []*entity.StreamSpec) *Do
 	}
 
 	if config.SubtitleFormat == "" {
-		config.SubtitleFormat = "srt" // 默认设为srt
+		config.SubtitleFormat = "srt"
 	}
 
 	return &DownloadManager{
@@ -102,15 +101,24 @@ func NewDownloadManager(config *ManagerConfig, streams []*entity.StreamSpec) *Do
 		config:           config,
 		selectedStreams:  streams,
 		outputFiles:      make([]*OutputFile, 0),
-		speedContainers:  make(map[int]*util.SpeedContainer),
 		fileDictionaries: make(map[*entity.StreamSpec]map[int]string),
 		streamKIDs:       make(map[*entity.StreamSpec]string),
 		validationFailed: false,
 	}
 }
 
-// StartDownloadAsync starts the download process asynchronously.
-func (dm *DownloadManager) StartDownloadAsync() error {
+// StartDownload starts the download process.
+func (dm *DownloadManager) StartDownload() error {
+	util.UI.Start()
+	util.Logger.SetUIActive(true)
+
+	// Defer the final actions
+	defer func() {
+		util.UI.Stop()
+		util.Logger.SetUIActive(false)
+		util.Logger.Info("所有下载任务完成")
+	}()
+
 	util.Logger.InfoMarkUp("[white on green]开始下载任务[/]")
 
 	if dm.config.MuxAfterDone {
@@ -118,38 +126,34 @@ func (dm *DownloadManager) StartDownloadAsync() error {
 		util.Logger.WarnMarkUp("你已开启下载完成后混流，自动开启二进制合并")
 	}
 
-	progress := util.NewProgress()
-	tasks := make(map[*entity.StreamSpec]*util.ProgressTask)
+	streamTaskMap := make(map[*entity.StreamSpec]*util.Task)
 	downloadResults := make(map[*entity.StreamSpec]*DownloadStreamResult)
 
 	for i, stream := range dm.selectedStreams {
 		description := dm.getStreamDescription(stream, i)
-		task := progress.AddTask(description)
-		tasks[stream] = task
-		speedContainer := progress.GetSpeedContainer(task.ID)
-		dm.speedContainers[task.ID] = speedContainer
+		// Placeholder values, will be updated in downloadSingleStreamOnly
+		task := util.UI.AddTask(util.TaskTypeDownload, description, 0, 0)
+		streamTaskMap[stream] = task
 	}
 
 	var downloadError error
-	progress.StartAsync(func(p *util.Progress) {
+	var downloadWg sync.WaitGroup
+	downloadWg.Add(1)
+	go func() {
+		defer downloadWg.Done()
 		if dm.config.ConcurrentDownload {
-			downloadError = dm.downloadStreamsConcurrently(tasks, downloadResults)
+			downloadError = dm.downloadStreamsConcurrently(streamTaskMap, downloadResults)
 		} else {
-			downloadError = dm.downloadStreamsSequentially(tasks, downloadResults)
+			downloadError = dm.downloadStreamsSequentially(streamTaskMap, downloadResults)
 		}
-	})
+	}()
+
+	downloadWg.Wait()
+	dm.mergeWaitGroup.Wait()
 
 	if downloadError != nil {
-		util.Logger.ErrorMarkUp("[white on red]下载失败[/]: %s", downloadError.Error())
-		return downloadError
+		// Error is already logged
 	}
-
-	if !dm.config.SkipMerge {
-		dm.mergeWaitGroup.Wait()
-	}
-
-	progress.Stop()
-	time.Sleep(100 * time.Millisecond)
 
 	muxSuccess := true
 	if dm.config.MuxAfterDone && len(dm.outputFiles) > 0 {
@@ -160,70 +164,107 @@ func (dm *DownloadManager) StartDownloadAsync() error {
 		}
 	}
 
-	if dm.config.DeleteAfterDone && !dm.config.SkipMerge && muxSuccess && !dm.validationFailed {
-		dm.cleanupTempFiles()
-	} else if !muxSuccess || dm.validationFailed {
-		util.Logger.InfoMarkUp("任务失败，保留临时文件以便调试")
+	if dm.config.DeleteAfterDone {
+		// Check if all critical steps were successful
+		// SkipMerge being true means we should not delete files if DeleteAfterDone is true,
+		// as merging is a critical step for a "successful" operation in that context.
+		allStepsSuccess := downloadError == nil && !dm.config.SkipMerge && muxSuccess && !dm.validationFailed
+		if allStepsSuccess {
+			dm.cleanupTempFiles()
+			util.Logger.InfoMarkUp("任务成功完成，临时文件已清理")
+		} else {
+			// This 'else' covers cases where DeleteAfterDone is true, but something failed or was skipped.
+			var reasons []string
+			if downloadError != nil {
+				reasons = append(reasons, "下载失败")
+			}
+			// If SkipMerge is true, and user wants to delete on success, we treat skipping merge as a reason to keep files.
+			if dm.config.SkipMerge {
+				reasons = append(reasons, "用户设置了跳过合并")
+			}
+			if !muxSuccess {
+				reasons = append(reasons, "混流失败")
+			}
+			if dm.validationFailed {
+				reasons = append(reasons, "文件验证或后处理失败")
+			}
+
+			if len(reasons) > 0 {
+				util.Logger.InfoMarkUp("由于 (%s)，临时文件已保留以便调试。", strings.Join(reasons, ", "))
+			} else if !allStepsSuccess {
+				// Fallback message if no specific reason was caught by the checks above but allStepsSuccess is false.
+				// This could happen if the logic for allStepsSuccess has a subtle case not covered by the explicit reason checks.
+				util.Logger.InfoMarkUp("任务未能完全成功，临时文件已保留以便调试。")
+			}
+		}
+	} else {
+		// DeleteAfterDone is false
+		util.Logger.InfoMarkUp("根据设置 (--delete-after-done=false)，临时文件已保留。")
 	}
 
-	return nil
+	return downloadError
 }
 
-func (dm *DownloadManager) downloadStreamsSequentially(tasks map[*entity.StreamSpec]*util.ProgressTask, results map[*entity.StreamSpec]*DownloadStreamResult) error {
-	for i, stream := range dm.selectedStreams {
+func (dm *DownloadManager) downloadStreamsSequentially(tasks map[*entity.StreamSpec]*util.Task, results map[*entity.StreamSpec]*DownloadStreamResult) error {
+	var firstError error
+	for _, stream := range dm.selectedStreams {
 		task := tasks[stream]
-		speedContainer := dm.speedContainers[task.ID]
-		result := dm.downloadSingleStreamOnly(stream, task, speedContainer)
+		result := dm.downloadSingleStreamOnly(stream, task)
 		results[stream] = result
 		if !result.Success {
-			return fmt.Errorf("流 %d 下载失败: %v", i, result.Error)
+			task.SetError(result.Error)
+			if firstError == nil {
+				firstError = fmt.Errorf("流 %s 下载失败: %v", dm.getStreamDescription(stream, task.ID), result.Error)
+			}
 		}
-		if !dm.config.SkipMerge {
+		if !dm.config.SkipMerge && result.Success {
 			dm.mergeWaitGroup.Add(1)
 			go dm.mergeStreamInBackground(stream, result, task)
 		}
 	}
-	return nil
+	return firstError
 }
 
-func (dm *DownloadManager) downloadStreamsConcurrently(tasks map[*entity.StreamSpec]*util.ProgressTask, results map[*entity.StreamSpec]*DownloadStreamResult) error {
+func (dm *DownloadManager) downloadStreamsConcurrently(tasks map[*entity.StreamSpec]*util.Task, results map[*entity.StreamSpec]*DownloadStreamResult) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	errChan := make(chan error, len(dm.selectedStreams))
 
-	for i, stream := range dm.selectedStreams {
+	for _, stream := range dm.selectedStreams {
 		wg.Add(1)
-		go func(idx int, s *entity.StreamSpec) {
+		go func(s *entity.StreamSpec) {
 			defer wg.Done()
 			task := tasks[s]
-			speedContainer := dm.speedContainers[task.ID]
-			result := dm.downloadSingleStreamOnly(s, task, speedContainer)
+			result := dm.downloadSingleStreamOnly(s, task)
 			mu.Lock()
 			results[s] = result
 			mu.Unlock()
 			if !result.Success {
-				errChan <- fmt.Errorf("流 %d 下载失败: %v", idx, result.Error)
+				task.SetError(result.Error)
+				errChan <- fmt.Errorf("流 %s 下载失败: %v", dm.getStreamDescription(s, task.ID), result.Error)
 				return
 			}
 			if !dm.config.SkipMerge {
 				dm.mergeWaitGroup.Add(1)
 				go dm.mergeStreamInBackground(s, result, task)
 			}
-		}(i, stream)
+		}(stream)
 	}
 
 	wg.Wait()
 	close(errChan)
 
+	var firstError error
 	for err := range errChan {
-		return err
+		if firstError == nil {
+			firstError = err
+		}
 	}
-	return nil
+	return firstError
 }
 
-func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, task *util.ProgressTask, speedContainer *util.SpeedContainer) *DownloadStreamResult {
+func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, task *util.Task) *DownloadStreamResult {
 	result := &DownloadStreamResult{Success: false}
-	speedContainer.ResetVars()
 
 	if stream.Playlist == nil {
 		result.Error = fmt.Errorf("流的播放列表为空")
@@ -250,8 +291,11 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 	if stream.Playlist.MediaInit != nil {
 		totalSegments++
 	}
-	task.SetMaxValue(float64(totalSegments))
-	task.StartTask()
+	task.Total = float64(totalSegments)
+	task.TotalCount = int64(totalSegments)
+	if stream.Playlist.TotalBytes > 0 {
+		task.TotalBytes = stream.Playlist.TotalBytes
+	}
 
 	streamDir := dm.getStreamOutputDir(stream, task.ID)
 	result.StreamDir = streamDir
@@ -264,6 +308,9 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 
 	var currentKID string
 	var readInfo bool
+	speedContainer := task.GetSpeedContainer()
+	var overallAesDecryptTask *util.Task  // Task for the entire stream's AES-128 decryption
+	var overallCencDecryptTask *util.Task // Task for the entire stream's CENC decryption
 
 	if stream.Playlist.MediaInit != nil {
 		if !dm.config.BinaryMerge && (stream.MediaType == nil || *stream.MediaType != entity.MediaTypeSubtitles) {
@@ -271,7 +318,7 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 			util.Logger.WarnMarkUp("检测到fMP4，自动开启二进制合并")
 		}
 		initPath := filepath.Join(streamDir, "_init.mp4.tmp")
-		downloadResult := dm.downloader.DownloadSegment(stream.Playlist.MediaInit, initPath, speedContainer, dm.config.Headers)
+		downloadResult := dm.downloader.DownloadSegment(stream.Playlist.MediaInit, initPath, speedContainer, dm.config.Headers, nil) // Pass nil for overallAesDecryptTask for init
 		if downloadResult == nil || !downloadResult.Success {
 			result.Error = fmt.Errorf("初始化段下载失败")
 			return result
@@ -288,12 +335,24 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 			dm.config.Keys = append(dm.config.Keys, key)
 		}
 
-		if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 {
+		// CENC decryption for init segment (if applicable)
+		// This still creates a temporary task for the init segment only, as it's a single operation.
+		// The overallCencDecryptTask is for the main segments.
+		if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 && stream.Playlist.MediaInit.EncryptInfo != nil && stream.Playlist.MediaInit.EncryptInfo.Method == entity.EncryptMethodCENC {
 			decPath := strings.Replace(mp4InitFile, ".tmp", "_dec.tmp", 1)
-			if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, mp4InitFile, decPath, currentKID, false); success {
+			var segmentSize int64
+			if info, err := os.Stat(mp4InitFile); err == nil {
+				segmentSize = info.Size()
+			}
+			// Create a temporary task for this specific init segment CENC decryption
+			initCencDecryptTask := util.UI.AddTask(util.TaskTypeDecrypt, filepath.Base(mp4InitFile)+"(Init CENC)", 1, segmentSize)
+			if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, mp4InitFile, decPath, currentKID, initCencDecryptTask); success {
 				dm.mu.Lock()
 				dm.fileDictionaries[stream][-1] = decPath
 				dm.mu.Unlock()
+			} else {
+				// Handle init segment CENC decryption failure if necessary
+				util.Logger.Error("Init segment CENC decryption failed for %s", mp4InitFile)
 			}
 		}
 
@@ -310,8 +369,8 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 	}
 
 	if !dm.config.BinaryMerge {
-		for _, seg := range segments {
-			if seg.EncryptInfo.Method == entity.EncryptMethodCENC {
+		for _, seg := range segments { // Check all segments, not just the remaining ones
+			if seg.EncryptInfo != nil && seg.EncryptInfo.Method == entity.EncryptMethodCENC {
 				dm.config.BinaryMerge = true
 				util.Logger.WarnMarkUp("检测到CENC加密，自动开启二进制合并")
 				break
@@ -319,9 +378,56 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 		}
 	}
 
+	// Create overall decryption tasks *before* processing the first data segment (if any)
+	// This ensures tasks exist if the first data segment itself needs decryption.
+	if stream.Playlist != nil {
+		// AES-128 overall task
+		var aesEncryptedSegmentsCount int64
+		var totalAesEncryptedBytes int64
+		isStreamAesEncrypted := false
+		for _, seg := range stream.Playlist.GetAllSegments() { // Iterate all segments for accurate count
+			if seg.IsEncrypted && seg.EncryptInfo != nil && seg.EncryptInfo.Method == entity.EncryptMethodAES128 {
+				isStreamAesEncrypted = true
+				aesEncryptedSegmentsCount++
+				if seg.ExpectLength != nil {
+					totalAesEncryptedBytes += *seg.ExpectLength
+				}
+			}
+		}
+		if isStreamAesEncrypted && aesEncryptedSegmentsCount > 0 {
+			if totalAesEncryptedBytes == 0 && stream.Playlist.TotalBytes > 0 {
+				totalAesEncryptedBytes = stream.Playlist.TotalBytes // Fallback
+			}
+			overallAesDecryptTask = util.UI.AddTask(util.TaskTypeDecrypt, dm.getStreamDescription(stream, task.ID)+" (AES-128)", aesEncryptedSegmentsCount, totalAesEncryptedBytes)
+		}
+
+		// CENC overall task
+		if dm.config.MP4RealTimeDecryption && currentKID != "" { // currentKID might be from init or first segment
+			var cencSegmentsCount int64
+			var totalCencBytes int64
+			isStreamCencEncrypted := false
+			for _, seg := range stream.Playlist.GetAllSegments() { // Iterate all segments
+				if seg.IsEncrypted && seg.EncryptInfo != nil && seg.EncryptInfo.Method == entity.EncryptMethodCENC {
+					isStreamCencEncrypted = true
+					cencSegmentsCount++
+					if seg.ExpectLength != nil {
+						totalCencBytes += *seg.ExpectLength
+					}
+				}
+			}
+			if isStreamCencEncrypted && cencSegmentsCount > 0 {
+				if totalCencBytes == 0 && stream.Playlist.TotalBytes > 0 {
+					totalCencBytes = stream.Playlist.TotalBytes // Fallback
+				}
+				overallCencDecryptTask = util.UI.AddTask(util.TaskTypeDecrypt, dm.getStreamDescription(stream, task.ID)+" (CENC)", cencSegmentsCount, totalCencBytes)
+			}
+		}
+	}
+
 	if len(segments) > 0 && (stream.Playlist.MediaInit == nil || stream.ExtractorType == entity.ExtractorTypeMSS) {
 		firstSegment := segments[0]
-		segments = segments[1:]
+		// segments = segments[1:] // Process first segment, then the rest
+
 		padLength := len(fmt.Sprintf("%d", len(stream.Playlist.GetAllSegments())))
 		ext := "ts"
 		if stream.Extension != "" {
@@ -329,40 +435,69 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 		}
 		fileName := fmt.Sprintf("%0*d.%s.tmp", padLength, firstSegment.Index, ext)
 		segmentPath := filepath.Join(streamDir, fileName)
-		downloadResult := dm.downloader.DownloadSegment(firstSegment, segmentPath, speedContainer, dm.config.Headers)
+
+		// Pass overallAesDecryptTask for AES-128 decryption within DownloadSegment
+		downloadResult := dm.downloader.DownloadSegment(firstSegment, segmentPath, speedContainer, dm.config.Headers, overallAesDecryptTask)
 		if downloadResult == nil || !downloadResult.Success {
 			result.Error = fmt.Errorf("第一个分片下载失败")
 			return result
 		}
 		task.Increment(1)
-		dm.mu.Lock()
-		dm.fileDictionaries[stream][int(firstSegment.Index)] = downloadResult.FilePath
-		dm.mu.Unlock()
 
-		if stream.Playlist.MediaInit == nil {
+		decryptedFilePath := downloadResult.FilePath
+		// Handle CENC decryption for the first segment if applicable, using overallCencDecryptTask
+		if dm.config.MP4RealTimeDecryption && currentKID == "" { // If KID wasn't from init, try to get it now
 			mp4Info, _ := util.GetMP4Info(downloadResult.FilePath)
 			currentKID = mp4Info.KID
 			if key, _ := util.SearchKeyFromFile(dm.config.KeyTextFile, currentKID); key != "" {
 				dm.config.Keys = append(dm.config.Keys, key)
 			}
-			if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 {
-				decPath := strings.Replace(downloadResult.FilePath, ".tmp", "_dec.tmp", 1)
-				if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, downloadResult.FilePath, decPath, currentKID, false); success {
-					downloadResult.FilePath = decPath
-					dm.mu.Lock()
-					dm.fileDictionaries[stream][int(firstSegment.Index)] = decPath
-					dm.mu.Unlock()
+			// Re-evaluate overallCencDecryptTask creation if KID is now available and task not yet created
+			if overallCencDecryptTask == nil && dm.config.MP4RealTimeDecryption && currentKID != "" {
+				var cencSegmentsCount int64
+				var totalCencBytes int64
+				isStreamCencEncrypted := false
+				for _, seg := range stream.Playlist.GetAllSegments() {
+					if seg.IsEncrypted && seg.EncryptInfo != nil && seg.EncryptInfo.Method == entity.EncryptMethodCENC {
+						isStreamCencEncrypted = true
+						cencSegmentsCount++
+						if seg.ExpectLength != nil {
+							totalCencBytes += *seg.ExpectLength
+						}
+					}
+				}
+				if isStreamCencEncrypted && cencSegmentsCount > 0 {
+					if totalCencBytes == 0 && stream.Playlist.TotalBytes > 0 {
+						totalCencBytes = stream.Playlist.TotalBytes
+					}
+					overallCencDecryptTask = util.UI.AddTask(util.TaskTypeDecrypt, dm.getStreamDescription(stream, task.ID)+" (CENC)", cencSegmentsCount, totalCencBytes)
 				}
 			}
+		}
+
+		if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 && firstSegment.EncryptInfo != nil && firstSegment.EncryptInfo.Method == entity.EncryptMethodCENC {
+			decPath := strings.Replace(downloadResult.FilePath, ".tmp", "_dec.tmp", 1)
+			if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, downloadResult.FilePath, decPath, currentKID, overallCencDecryptTask); success {
+				decryptedFilePath = decPath
+			} else {
+				if overallCencDecryptTask != nil { // Check if task exists
+					overallCencDecryptTask.SetError(fmt.Errorf("CENC实时解密失败: %s", filepath.Base(downloadResult.FilePath)))
+				}
+			}
+		}
+		dm.mu.Lock()
+		dm.fileDictionaries[stream][int(firstSegment.Index)] = decryptedFilePath
+		dm.mu.Unlock()
+
+		if stream.Playlist.MediaInit == nil { // Only read media info if no init segment
 			if !readInfo {
 				util.Logger.WarnMarkUp("读取媒体信息...")
-				infos, err := util.GetMediaInfo(dm.config.FFmpegPath, downloadResult.FilePath)
+				infos, err := util.GetMediaInfo(dm.config.FFmpegPath, decryptedFilePath)
 				if err == nil {
 					result.Mediainfos = infos
 					dm.changeSpecInfo(stream, infos)
-					// C# Logic: if it's audio only, disable binary merge
 					if stream.MediaType != nil && *stream.MediaType == entity.MediaTypeAudio {
-						dm.config.BinaryMerge = false
+						dm.config.BinaryMerge = false // If it's audio, prefer ffmpeg merge
 					}
 					for idx, info := range infos {
 						util.Logger.InfoMarkUp("[grey][[%d]] %s, %s (%s), %s[/]", idx, info.Type, info.Format, info.FormatInfo, info.Bitrate)
@@ -378,7 +513,7 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 				result.Error = fmt.Errorf("创建MSS处理器失败: %w", err)
 				return result
 			}
-			firstSegmentBytes, err := os.ReadFile(downloadResult.FilePath)
+			firstSegmentBytes, err := os.ReadFile(decryptedFilePath)
 			if err != nil {
 				result.Error = fmt.Errorf("读取第一个分片失败: %w", err)
 				return result
@@ -388,20 +523,33 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 				result.Error = fmt.Errorf("生成MSS头部失败: %w", err)
 				return result
 			}
-			initFilePath := dm.fileDictionaries[stream][-1]
+			initFilePath := dm.fileDictionaries[stream][-1]             // Assuming init is always -1
+			if initFilePath == "" && stream.Playlist.MediaInit != nil { // Should not happen if MediaInit is nil
+				initFilePath = filepath.Join(streamDir, "_init.mp4.tmp") // Fallback, though logic implies init should exist
+				dm.mu.Lock()
+				dm.fileDictionaries[stream][-1] = initFilePath
+				dm.mu.Unlock()
+			}
 			if err := os.WriteFile(initFilePath, header, 0644); err != nil {
 				result.Error = fmt.Errorf("写入MSS头部失败: %w", err)
 				return result
 			}
 			util.Logger.Info("MSS init box生成并写入成功")
 		}
+		segments = segments[1:] // Now remove the first segment for the loop
 	}
 
 	dm.mu.Lock()
 	dm.streamKIDs[stream] = currentKID
 	dm.mu.Unlock()
 
-	if success := dm.downloadSegments(segments, streamDir, task, speedContainer, stream, currentKID); !success {
+	if success := dm.downloadSegments(segments, streamDir, task, stream, currentKID, overallAesDecryptTask, overallCencDecryptTask); !success {
+		if overallAesDecryptTask != nil && !overallAesDecryptTask.IsFinished {
+			overallAesDecryptTask.SetError(fmt.Errorf("依赖的下载任务失败"))
+		}
+		if overallCencDecryptTask != nil && !overallCencDecryptTask.IsFinished {
+			overallCencDecryptTask.SetError(fmt.Errorf("依赖的下载任务失败"))
+		}
 		result.Error = fmt.Errorf("分段下载失败")
 		return result
 	}
@@ -410,8 +558,9 @@ func (dm *DownloadManager) downloadSingleStreamOnly(stream *entity.StreamSpec, t
 	return result
 }
 
-func (dm *DownloadManager) downloadSegments(segments []*entity.MediaSegment, outputDir string, task *util.ProgressTask, speedContainer *util.SpeedContainer, stream *entity.StreamSpec, currentKID string) bool {
-	padLength := len(fmt.Sprintf("%d", len(segments)))
+func (dm *DownloadManager) downloadSegments(segments []*entity.MediaSegment, outputDir string, task *util.Task, stream *entity.StreamSpec, currentKID string, overallAesDecryptTask *util.Task, overallCencDecryptTask *util.Task) bool {
+	padLength := len(fmt.Sprintf("%d", len(stream.Playlist.GetAllSegments()))) // Use all segments for pad length
+	speedContainer := task.GetSpeedContainer()
 	if dm.config.ThreadCount <= 1 {
 		for _, segment := range segments {
 			ext := "ts"
@@ -420,16 +569,22 @@ func (dm *DownloadManager) downloadSegments(segments []*entity.MediaSegment, out
 			}
 			fileName := fmt.Sprintf("%0*d.%s.tmp", padLength, segment.Index, ext)
 			segmentPath := filepath.Join(outputDir, fileName)
-			result := dm.downloader.DownloadSegment(segment, segmentPath, speedContainer, dm.config.Headers)
-			if result != nil && result.Success {
-				if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 {
-					decPath := strings.Replace(result.FilePath, ".tmp", "_dec.tmp", 1)
-					if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, result.FilePath, decPath, currentKID, false); success {
-						result.FilePath = decPath
+			downloadSegResult := dm.downloader.DownloadSegment(segment, segmentPath, speedContainer, dm.config.Headers, overallAesDecryptTask) // AES handled by simple downloader
+			if downloadSegResult != nil && downloadSegResult.Success {
+				decryptedFilePath := downloadSegResult.FilePath
+				if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 && segment.EncryptInfo != nil && segment.EncryptInfo.Method == entity.EncryptMethodCENC {
+					decPath := strings.Replace(downloadSegResult.FilePath, ".tmp", "_dec.tmp", 1)
+					if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, downloadSegResult.FilePath, decPath, currentKID, overallCencDecryptTask); success {
+						decryptedFilePath = decPath
+					} else {
+						if overallCencDecryptTask != nil {
+							overallCencDecryptTask.SetError(fmt.Errorf("CENC实时解密失败: %s", filepath.Base(downloadSegResult.FilePath)))
+						}
+						// Decide if one CENC failure should stop everything or just mark this segment
 					}
 				}
 				dm.mu.Lock()
-				dm.fileDictionaries[stream][int(segment.Index)] = result.FilePath
+				dm.fileDictionaries[stream][int(segment.Index)] = decryptedFilePath
 				dm.mu.Unlock()
 				task.Increment(1)
 			} else {
@@ -439,13 +594,14 @@ func (dm *DownloadManager) downloadSegments(segments []*entity.MediaSegment, out
 			}
 		}
 	} else {
-		return dm.downloadSegmentsConcurrently(segments, outputDir, task, speedContainer, padLength, stream, currentKID)
+		return dm.downloadSegmentsConcurrently(segments, outputDir, task, padLength, stream, currentKID, overallAesDecryptTask, overallCencDecryptTask)
 	}
 	return true
 }
 
-func (dm *DownloadManager) downloadSegmentsConcurrently(segments []*entity.MediaSegment, outputDir string, task *util.ProgressTask, speedContainer *util.SpeedContainer, padLength int, stream *entity.StreamSpec, currentKID string) bool {
+func (dm *DownloadManager) downloadSegmentsConcurrently(segments []*entity.MediaSegment, outputDir string, task *util.Task, padLength int, stream *entity.StreamSpec, currentKID string, overallAesDecryptTask *util.Task, overallCencDecryptTask *util.Task) bool {
 	maxWorkers := dm.config.ThreadCount
+	speedContainer := task.GetSpeedContainer()
 	segmentChan := make(chan struct {
 		segment *entity.MediaSegment
 		index   int
@@ -464,16 +620,22 @@ func (dm *DownloadManager) downloadSegmentsConcurrently(segments []*entity.Media
 				}
 				fileName := fmt.Sprintf("%0*d.%s.tmp", padLength, item.index, ext)
 				segmentPath := filepath.Join(outputDir, fileName)
-				result := dm.downloader.DownloadSegment(item.segment, segmentPath, speedContainer, dm.config.Headers)
-				if result != nil && result.Success {
-					if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 {
-						decPath := strings.Replace(result.FilePath, ".tmp", "_dec.tmp", 1)
-						if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, result.FilePath, decPath, currentKID, false); success {
-							result.FilePath = decPath
+				downloadSegResult := dm.downloader.DownloadSegment(item.segment, segmentPath, speedContainer, dm.config.Headers, overallAesDecryptTask) // AES handled by simple downloader
+				if downloadSegResult != nil && downloadSegResult.Success {
+					decryptedFilePath := downloadSegResult.FilePath
+					if dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 && item.segment.EncryptInfo.Method == entity.EncryptMethodCENC {
+						decPath := strings.Replace(downloadSegResult.FilePath, ".tmp", "_dec.tmp", 1)
+						if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, downloadSegResult.FilePath, decPath, currentKID, overallCencDecryptTask); success {
+							decryptedFilePath = decPath
+						} else {
+							if overallCencDecryptTask != nil {
+								overallCencDecryptTask.SetError(fmt.Errorf("CENC实时解密失败: %s", filepath.Base(downloadSegResult.FilePath)))
+							}
+							// Decide if one CENC failure should stop everything
 						}
 					}
 					dm.mu.Lock()
-					dm.fileDictionaries[stream][item.index] = result.FilePath
+					dm.fileDictionaries[stream][item.index] = decryptedFilePath
 					dm.mu.Unlock()
 					task.Increment(1)
 				} else {
@@ -507,7 +669,7 @@ func (dm *DownloadManager) mergeSegments(inputDir string, outputPath *string, st
 		return dm.binaryMergeFiles(inputDir, *outputPath, stream)
 	}
 
-	return dm.ffmpegMergeFiles(inputDir, *outputPath, stream, inputDir) // 工作目录就是输入目录
+	return dm.ffmpegMergeFiles(inputDir, *outputPath, stream, inputDir)
 }
 
 func (dm *DownloadManager) binaryMergeFiles(inputDir, outputPath string, stream *entity.StreamSpec) bool {
@@ -586,7 +748,7 @@ func (dm *DownloadManager) ffmpegMergeFiles(inputDir, outputPath string, stream 
 	return util.MergeByFFmpeg(dm.config.FFmpegPath, files, outputBase, muxFormat, dm.config.UseAACFilter, &util.MergeOptions{UseConcatDemuxer: dm.config.UseFFmpegConcatDemuxer}, workingDir) == nil
 }
 
-func (dm *DownloadManager) mergeStreamInBackground(stream *entity.StreamSpec, result *DownloadStreamResult, task *util.ProgressTask) {
+func (dm *DownloadManager) mergeStreamInBackground(stream *entity.StreamSpec, result *DownloadStreamResult, task *util.Task) {
 	defer dm.mergeWaitGroup.Done()
 
 	if err := dm.postProcessStreamData(stream, result); err != nil {
@@ -598,17 +760,112 @@ func (dm *DownloadManager) mergeStreamInBackground(stream *entity.StreamSpec, re
 	}
 
 	outputPath := dm.getOutputPath(stream, task.ID)
-	if dm.mergeSegments(result.StreamDir, &outputPath, stream) {
+
+	// --- MERGE TASK & PROGRESS ---
+	dm.mu.RLock()
+	fileDic := dm.fileDictionaries[stream]
+	dm.mu.RUnlock()
+
+	var totalSize int64
+	for _, filePath := range fileDic {
+		if info, err := os.Stat(filePath); err == nil {
+			totalSize += info.Size()
+		}
+	}
+
+	mergeTask := util.UI.AddTask(util.TaskTypeMerge, dm.getStreamDescription(stream, task.ID), 1, totalSize)
+	stopProgress := make(chan bool)
+	go func() {
+		var lastSize int64
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			case <-ticker.C:
+				// 检查预期的输出路径，如果FFmpeg合并，则检查实际的输出路径
+				checkPath := outputPath
+				mediaType := entity.MediaTypeVideo
+				if stream.MediaType != nil {
+					mediaType = *stream.MediaType
+				}
+				if !dm.config.BinaryMerge && mediaType != entity.MediaTypeSubtitles && dm.config.FFmpegPath != "" {
+					outputBase := strings.TrimSuffix(outputPath, filepath.Ext(outputPath))
+					muxFormat := "MP4"
+					if stream.MediaType != nil && *stream.MediaType == entity.MediaTypeAudio {
+						muxFormat = "M4A"
+					}
+					checkPath = outputBase + util.GetMuxExtension(muxFormat)
+				}
+
+				if info, err := os.Stat(checkPath); err == nil {
+					currentSize := info.Size()
+					increment := currentSize - lastSize
+					if increment > 0 {
+						mergeTask.GetSpeedContainer().Add(increment)
+					}
+					mergeTask.Update(0, currentSize)
+					lastSize = currentSize
+				} else if !os.IsNotExist(err) { // Log error if it's not "file not found"
+					util.Logger.Debug("Error stating file for merge progress: %s, %v", checkPath, err)
+				}
+			}
+		}
+	}()
+
+	mergeSuccess := dm.mergeSegments(result.StreamDir, &outputPath, stream)
+	close(stopProgress) // Stop the progress checker
+
+	finalOutputPath := outputPath
+	// 如果使用FFmpeg合并，则修复文件路径
+	mediaType := entity.MediaTypeVideo
+	if stream.MediaType != nil {
+		mediaType = *stream.MediaType
+	}
+	if !dm.config.BinaryMerge && mediaType != entity.MediaTypeSubtitles && dm.config.FFmpegPath != "" {
+		outputBase := strings.TrimSuffix(outputPath, filepath.Ext(outputPath))
+		muxFormat := "MP4"
+		if stream.MediaType != nil && *stream.MediaType == entity.MediaTypeAudio {
+			muxFormat = "M4A"
+		}
+		finalOutputPath = outputBase + util.GetMuxExtension(muxFormat) // 使用 util.GetMuxExtension
+	}
+
+	if mergeSuccess {
+		var actualMergedSize int64
+		if info, err := os.Stat(finalOutputPath); err == nil { // 使用 finalOutputPath
+			actualMergedSize = info.Size()
+		} else {
+			util.Logger.Warn("无法获取合并后文件 %s 的大小，将使用预估大小进行进度更新", finalOutputPath) // 使用 finalOutputPath
+			actualMergedSize = totalSize                                        // totalSize is sum of pre-merge segments
+		}
+		mergeTask.Update(1, actualMergedSize) // Mark as complete using actual merged size
+		mergeTask.ProcessedCount = 1
 		dm.mu.RLock()
 		currentKID := dm.streamKIDs[stream]
 		dm.mu.RUnlock()
 
-		if !dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 {
-			util.Logger.Info("正在解密合并后的文件...")
-			decPath := strings.TrimSuffix(outputPath, filepath.Ext(outputPath)) + "_dec" + filepath.Ext(outputPath)
-			if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, outputPath, decPath, currentKID, false); success {
-				os.Remove(outputPath)
-				os.Rename(decPath, outputPath)
+		// Post-merge decryption is ONLY for CENC (KID-based) when not using real-time decryption.
+		// AES-128 is decrypted segment by segment in SimpleDownloader.
+		if !dm.config.MP4RealTimeDecryption && currentKID != "" && len(dm.config.Keys) > 0 && dm.config.DecryptionEngine == "MP4DECRYPT" {
+			util.Logger.Info("正在对合并后的CENC加密文件进行解密...")
+			var decryptTotalSize int64
+			if info, err := os.Stat(finalOutputPath); err == nil { // 使用 finalOutputPath
+				decryptTotalSize = info.Size()
+			}
+			decryptTask := util.UI.AddTask(util.TaskTypeDecrypt, filepath.Base(finalOutputPath), 1, decryptTotalSize)              // 使用 finalOutputPath
+			decPath := strings.TrimSuffix(finalOutputPath, filepath.Ext(finalOutputPath)) + "_dec" + filepath.Ext(finalOutputPath) // 使用 finalOutputPath
+
+			if success, _ := util.Decrypt(dm.config.DecryptionEngine, dm.config.DecryptionBinaryPath, dm.config.Keys, finalOutputPath, decPath, currentKID, decryptTask); success { // 使用 finalOutputPath
+				os.Remove(finalOutputPath)              // 使用 finalOutputPath
+				os.Rename(decPath, finalOutputPath)     // 使用 finalOutputPath
+				decryptTask.Update(1, decryptTotalSize) // Mark as complete
+				decryptTask.ProcessedCount = 1
+			} else {
+				// Decryption failed, mark merge as failed too for consistency
+				mergeTask.SetError(fmt.Errorf("合并后CENC解密失败"))
+				return // Stop further processing
 			}
 		}
 
@@ -618,7 +875,7 @@ func (dm *DownloadManager) mergeStreamInBackground(stream *entity.StreamSpec, re
 		isAlreadyAdded := false
 		for _, f := range dm.outputFiles {
 			if f.Index == task.ID {
-				f.FilePath = outputPath
+				f.FilePath = finalOutputPath // 使用 finalOutputPath
 				isAlreadyAdded = true
 				break
 			}
@@ -627,13 +884,19 @@ func (dm *DownloadManager) mergeStreamInBackground(stream *entity.StreamSpec, re
 		if !isAlreadyAdded {
 			dm.outputFiles = append(dm.outputFiles, &OutputFile{
 				Index:       task.ID,
-				FilePath:    outputPath,
+				FilePath:    finalOutputPath, // 使用 finalOutputPath
 				LangCode:    stream.Language,
 				Description: stream.Name,
 				MediaType:   *stream.MediaType,
 				Mediainfos:  result.Mediainfos,
 			})
 		}
+	} else {
+		err := fmt.Errorf("合并失败: %s", dm.getStreamDescription(stream, task.ID))
+		mergeTask.SetError(err)
+		dm.mu.Lock()
+		dm.validationFailed = true
+		dm.mu.Unlock()
 	}
 }
 
@@ -673,7 +936,6 @@ func (dm *DownloadManager) postProcessStreamData(stream *entity.StreamSpec, resu
 			for index := range fileDic {
 				indices = append(indices, index)
 			}
-			// Sort indices to process files in order
 			for i := 0; i < len(indices)-1; i++ {
 				for j := i + 1; j < len(indices); j++ {
 					if indices[i] > indices[j] {
@@ -855,15 +1117,62 @@ func (dm *DownloadManager) performMuxAfterDone() bool {
 	}
 
 	if len(videoFiles) == 0 {
-		util.Logger.Warn("没有找到视频文件，无法执行混流操作")
-		return true
+		util.Logger.Warn("准备进行混流操作，但在已下载/合并的文件列表中没有找到可用的视频轨道。")
+
+		selectedVideoCount := 0
+		for _, s := range dm.selectedStreams {
+			if s.MediaType != nil && *s.MediaType == entity.MediaTypeVideo {
+				selectedVideoCount++
+			}
+		}
+		if selectedVideoCount > 0 {
+			util.Logger.Warn(fmt.Sprintf("程序最初选择了 %d 个视频流进行下载，但它们未能成功生成最终文件或在之前的步骤中失败。", selectedVideoCount))
+		}
+
+		hasExternalVideo := false
+		if dm.config.MuxOptions.MuxImports != nil {
+			for _, imp := range dm.config.MuxOptions.MuxImports {
+				if strings.ToLower(imp.Type) == "video" {
+					hasExternalVideo = true
+					util.Logger.Info(fmt.Sprintf("检测到外部导入的视频文件: %s", imp.FilePath))
+					break
+				}
+			}
+		}
+
+		if !hasExternalVideo && len(audioFiles) == 0 {
+			util.Logger.Warn("同时，在通过 -MuxImport 指定的外部文件中也没有视频轨道。混流操作将被跳过。")
+			return true // Skip muxing if no video internally and no video externally
+		}
+		if !hasExternalVideo && len(audioFiles) > 0 {
+			// This is the audio-only case
+		} else {
+			util.Logger.Info("将尝试仅使用通过 -MuxImport 指定的外部视频轨道进行混流。")
+		}
 	}
 
 	allMuxSuccess := true
-	for _, videoFile := range videoFiles {
-		inputs := []*util.OutputFile{
-			{FilePath: videoFile.FilePath, MediaType: videoFile.MediaType, LangCode: videoFile.LangCode, Description: videoFile.Description},
+	if len(videoFiles) > 0 {
+		// Video-based muxing
+		for _, videoFile := range videoFiles {
+			inputs := []*util.OutputFile{
+				{FilePath: videoFile.FilePath, MediaType: videoFile.MediaType, LangCode: videoFile.LangCode, Description: videoFile.Description},
+			}
+			for _, audioFile := range audioFiles {
+				inputs = append(inputs, &util.OutputFile{FilePath: audioFile.FilePath, MediaType: audioFile.MediaType, LangCode: audioFile.LangCode, Description: audioFile.Description})
+			}
+			for _, subtitleFile := range subtitleFiles {
+				inputs = append(inputs, &util.OutputFile{FilePath: subtitleFile.FilePath, MediaType: subtitleFile.MediaType, LangCode: subtitleFile.LangCode, Description: subtitleFile.Description})
+			}
+
+			baseName := strings.TrimSuffix(videoFile.FilePath, filepath.Ext(videoFile.FilePath))
+			if !dm.executeMux(inputs, baseName) {
+				allMuxSuccess = false
+			}
 		}
+	} else if len(audioFiles) > 0 {
+		// Audio-only muxing
+		inputs := []*util.OutputFile{}
 		for _, audioFile := range audioFiles {
 			inputs = append(inputs, &util.OutputFile{FilePath: audioFile.FilePath, MediaType: audioFile.MediaType, LangCode: audioFile.LangCode, Description: audioFile.Description})
 		}
@@ -871,39 +1180,21 @@ func (dm *DownloadManager) performMuxAfterDone() bool {
 			inputs = append(inputs, &util.OutputFile{FilePath: subtitleFile.FilePath, MediaType: subtitleFile.MediaType, LangCode: subtitleFile.LangCode, Description: subtitleFile.Description})
 		}
 
-		util.Logger.Info("准备混流以下文件:")
-		for _, f := range inputs {
-			util.Logger.WarnMarkUp("[grey]%s[/]", filepath.Base(f.FilePath))
-		}
-
-		baseName := strings.TrimSuffix(videoFile.FilePath, filepath.Ext(videoFile.FilePath))
-		outputPath := fmt.Sprintf("%s.MUX", baseName)
-		finalMuxPath := outputPath + dm.getMuxExtension()
-		util.Logger.InfoMarkUp("Muxing to [grey]%s[/]", filepath.Base(finalMuxPath))
-
-		var currentMuxSuccess bool
-		// 对于轨道混流，所有输入都是绝对路径，工作目录可以是当前目录
-		workingDir, _ := os.Getwd()
-
-		if dm.config.MuxOptions.UseMkvmerge {
-			err := util.MuxInputsByMkvmerge(dm.config.MkvmergePath, inputs, outputPath, workingDir)
-			if err != nil {
-				util.Logger.Error("Mkvmerge混流失败: %+v", err)
+		if len(inputs) > 0 {
+			var baseName string
+			if dm.config.SaveName != "" {
+				// Ensure the directory exists
+				if err := os.MkdirAll(dm.config.SaveDir, 0755); err != nil {
+					util.Logger.Error("创建输出目录失败: %v", err)
+					return false
+				}
+				baseName = filepath.Join(dm.config.SaveDir, dm.config.SaveName)
+			} else {
+				baseName = strings.TrimSuffix(audioFiles[0].FilePath, filepath.Ext(audioFiles[0].FilePath))
 			}
-			currentMuxSuccess = err == nil
-		} else {
-			err := util.MuxInputsByFFmpeg(dm.config.FFmpegPath, inputs, outputPath, dm.config.MuxOptions.MuxFormat.String(), true, workingDir)
-			if err != nil {
-				util.Logger.Error("FFmpeg混流失败: %+v", err)
+			if !dm.executeMux(inputs, baseName) {
+				allMuxSuccess = false
 			}
-			currentMuxSuccess = err == nil
-		}
-
-		if currentMuxSuccess {
-			util.Logger.InfoMarkUp("[white on green]混流完成[/]: %s", finalMuxPath)
-		} else {
-			util.Logger.ErrorMarkUp("[white on red]混流失败[/]: %s", finalMuxPath)
-			allMuxSuccess = false
 		}
 	}
 
@@ -1026,7 +1317,7 @@ func (dm *DownloadManager) getMuxOutputPath() string {
 }
 
 func (dm *DownloadManager) getMuxExtension() string {
-	return util.GetMuxExtension(string(dm.config.MuxOptions.MuxFormat))
+	return util.GetMuxExtension(dm.config.MuxOptions.MuxFormat.String())
 }
 
 func (dm *DownloadManager) changeSpecInfo(stream *entity.StreamSpec, mediaInfos []*util.MediaInfo) {
@@ -1051,4 +1342,83 @@ func (dm *DownloadManager) changeSpecInfo(stream *entity.StreamSpec, mediaInfos 
 		mediaType := entity.MediaTypeAudio
 		stream.MediaType = &mediaType
 	}
+}
+
+func (dm *DownloadManager) executeMux(inputs []*util.OutputFile, baseName string) bool {
+	util.Logger.Info("准备混流以下文件:")
+	for _, f := range inputs {
+		util.Logger.WarnMarkUp("[grey]%s[/]", filepath.Base(f.FilePath))
+	}
+
+	outputPath := fmt.Sprintf("%s.MUX", baseName)
+	finalMuxPath := outputPath + dm.getMuxExtension()
+	util.Logger.InfoMarkUp("Muxing to [grey]%s[/]", filepath.Base(finalMuxPath))
+
+	var currentMuxSuccess bool
+	workingDir, _ := os.Getwd()
+
+	// --- MUX TASK & PROGRESS ---
+	var totalSize int64
+	for _, f := range inputs {
+		if info, err := os.Stat(f.FilePath); err == nil {
+			totalSize += info.Size()
+		}
+	}
+	muxTask := util.UI.AddTask(util.TaskTypeMux, filepath.Base(finalMuxPath), 1, totalSize)
+	stopProgress := make(chan bool)
+	go func() {
+		var lastSize int64
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			case <-ticker.C:
+				// Muxer might create the final file late, so check for the temp mux file first
+				checkPath := finalMuxPath
+				if _, err := os.Stat(checkPath); os.IsNotExist(err) {
+					checkPath = outputPath // Check for intermediate file
+				}
+				if info, err := os.Stat(checkPath); err == nil {
+					currentSize := info.Size()
+					increment := currentSize - lastSize
+					if increment > 0 {
+						muxTask.GetSpeedContainer().Add(increment)
+					}
+					muxTask.Update(0, currentSize)
+					lastSize = currentSize
+				}
+			}
+		}
+	}()
+
+	if dm.config.MuxOptions.UseMkvmerge {
+		err := util.MuxInputsByMkvmerge(dm.config.MkvmergePath, inputs, outputPath, workingDir)
+		if err != nil {
+			util.Logger.Error("Mkvmerge混流失败: %+v", err)
+		}
+		currentMuxSuccess = err == nil
+	} else {
+		err := util.MuxInputsByFFmpeg(dm.config.FFmpegPath, inputs, outputPath, dm.config.MuxOptions.MuxFormat.String(), true, workingDir)
+		if err != nil {
+			util.Logger.Error("FFmpeg混流失败: %+v", err)
+		}
+		currentMuxSuccess = err == nil
+	}
+
+	close(stopProgress) // Stop the progress checker
+
+	if currentMuxSuccess {
+		// Final update to 100%
+		if info, err := os.Stat(finalMuxPath); err == nil {
+			muxTask.Update(1, info.Size())
+		}
+		muxTask.ProcessedCount = 1
+		util.Logger.InfoMarkUp("[white on green]混流完成[/]: %s", finalMuxPath)
+	} else {
+		err := fmt.Errorf("混流失败: %s", filepath.Base(finalMuxPath))
+		muxTask.SetError(err)
+	}
+	return currentMuxSuccess
 }

@@ -356,6 +356,14 @@ func (p *DASHParser) parseRepresentation(repr Representation, adaptationSet Adap
 		return nil, fmt.Errorf("解析分片失败: %v", err)
 	}
 
+	// Fallback to calculate total bytes from bandwidth if not calculated from segments
+	if stream.Playlist.TotalBytes == 0 && stream.Bandwidth != nil && *stream.Bandwidth > 0 {
+		totalDuration := stream.Playlist.GetTotalDuration()
+		if totalDuration > 0 {
+			stream.Playlist.TotalBytes = int64((float64(*stream.Bandwidth) / 8.0) * totalDuration)
+		}
+	}
+
 	// 处理加密
 	if p.hasContentProtection(repr.ContentProtection) || p.hasContentProtection(adaptationSet.ContentProtection) {
 		if stream.Playlist.MediaInit != nil {
@@ -478,6 +486,7 @@ func (p *DASHParser) parseSegmentList(stream *entity.StreamSpec, segmentList Seg
 	}
 
 	// 处理分片
+	var totalBytes int64 = 0
 	timescale := 1
 	if segmentList.Timescale != "" {
 		if ts, err := strconv.Atoi(segmentList.Timescale); err == nil {
@@ -503,11 +512,13 @@ func (p *DASHParser) parseSegmentList(stream *entity.StreamSpec, segmentList Seg
 			start, expectLength := p.parseRange(segURL.MediaRange)
 			segment.StartRange = &start
 			segment.ExpectLength = &expectLength
+			totalBytes += expectLength
 		}
 
 		stream.Playlist.MediaParts[0].MediaSegments = append(stream.Playlist.MediaParts[0].MediaSegments, segment)
 	}
 
+	stream.Playlist.TotalBytes = totalBytes
 	return nil
 }
 

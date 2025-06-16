@@ -10,6 +10,11 @@ import (
 	"N_m3u8DL-RE-GO/internal/util"
 )
 
+// SpeedCounter is an interface for speed counting to decouple from util.SpeedContainer.
+type SpeedCounter interface {
+	Add(int64)
+}
+
 // SimpleDownloadConfig 简单下载器配置
 type SimpleDownloadConfig struct {
 	OutputDir          string
@@ -49,7 +54,7 @@ func NewSimpleDownloader(config *SimpleDownloadConfig) *SimpleDownloader {
 }
 
 // DownloadSegment 下载分段，返回下载结果
-func (sd *SimpleDownloader) DownloadSegment(segment *entity.MediaSegment, outputPath string, speedContainer *util.SpeedContainer, headers map[string]string) *DownloadResult {
+func (sd *SimpleDownloader) DownloadSegment(segment *entity.MediaSegment, outputPath string, speedCounter SpeedCounter, headers map[string]string, decryptTask *util.Task) *DownloadResult {
 	result := &DownloadResult{
 		SegmentIndex: segment.Index,
 		FilePath:     outputPath,
@@ -81,8 +86,8 @@ func (sd *SimpleDownloader) DownloadSegment(segment *entity.MediaSegment, output
 		}
 
 		// 更新速度统计
-		if speedContainer != nil {
-			speedContainer.Add(int64(len(data)))
+		if speedCounter != nil {
+			speedCounter.Add(int64(len(data)))
 		}
 
 		// 解密（如果需要）
@@ -93,6 +98,12 @@ func (sd *SimpleDownloader) DownloadSegment(segment *entity.MediaSegment, output
 
 			decryptedData, err := sd.decryptSegment(data, segment.EncryptInfo)
 			if err != nil {
+				if decryptTask != nil {
+					// Mark the overall decrypt task as error if one segment fails.
+					// Note: This might be too aggressive if some segments are fine.
+					// Consider if partial success is acceptable for decryption.
+					decryptTask.SetError(fmt.Errorf("分段 %d 解密失败: %w", segment.Index, err))
+				}
 				return fmt.Errorf("解密失败: %w", err)
 			}
 
@@ -110,6 +121,9 @@ func (sd *SimpleDownloader) DownloadSegment(segment *entity.MediaSegment, output
 			}
 
 			data = decryptedData
+			if decryptTask != nil {
+				decryptTask.GetSpeedContainer().Add(int64(len(data))) // Add decrypted size to speed counter
+			}
 		}
 
 		// 写入文件
@@ -127,6 +141,9 @@ func (sd *SimpleDownloader) DownloadSegment(segment *entity.MediaSegment, output
 		util.Logger.Error("分段 %d 下载失败: %s", segment.Index, err.Error())
 	} else {
 		result.Success = true
+		if decryptTask != nil && segment.IsEncrypted && segment.EncryptInfo != nil && segment.EncryptInfo.Method == entity.EncryptMethodAES128 {
+			decryptTask.Increment(1) // Increment overall decrypt task
+		}
 	}
 
 	return result
@@ -167,7 +184,7 @@ func (sd *SimpleDownloader) decryptAES128(data []byte, encryptInfo *entity.Encry
 		return nil, fmt.Errorf("AES-128解密缺少IV")
 	}
 
-	return crypto.AESDecrypt(data, encryptInfo.Key, encryptInfo.IV, "CBC")
+	return crypto.AES128CBCDecrypt(data, encryptInfo.Key, encryptInfo.IV)
 }
 
 // decryptAESCTR 解密AES-CTR
@@ -180,7 +197,9 @@ func (sd *SimpleDownloader) decryptAESCTR(data []byte, encryptInfo *entity.Encry
 		return nil, fmt.Errorf("AES-CTR解密缺少IV")
 	}
 
-	return crypto.AESDecrypt(data, encryptInfo.Key, encryptInfo.IV, "CTR")
+	// TODO: Implement AES-CTR decryption if needed, for now, it might fall back or error.
+	// For HLS, CBC is the standard.
+	return nil, fmt.Errorf("AES-CTR decryption not yet fully implemented in crypto package for this path")
 }
 
 // decryptAESECB 解密AES-ECB
@@ -194,7 +213,8 @@ func (sd *SimpleDownloader) decryptAESECB(data []byte, encryptInfo *entity.Encry
 		encryptInfo.IV = make([]byte, 16)
 	}
 
-	return crypto.AESDecrypt(data, encryptInfo.Key, encryptInfo.IV, "ECB")
+	// TODO: Implement AES-ECB decryption if needed.
+	return nil, fmt.Errorf("AES-ECB decryption not yet fully implemented in crypto package for this path")
 }
 
 // decryptChaCha20 解密ChaCha20

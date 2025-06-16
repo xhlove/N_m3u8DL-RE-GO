@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"fmt"
+	"os"
 
 	"golang.org/x/crypto/chacha20"
 )
@@ -85,4 +86,12 @@ func ChaCha20DecryptFile(filePath string, key, nonce []byte) error {
 	}
 
 	return nil
+}
+
+func readFileBytes(filePath string) ([]byte, error) {
+	return os.ReadFile(filePath)
+}
+
+func writeFileBytes(filePath string, data []byte) error {
+	return os.WriteFile(filePath, data, 0644)
 }

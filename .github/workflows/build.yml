@@ -33,11 +33,17 @@ jobs:
         run: |
           DATE=$(date -u -d '8 hours' +'%Y%m%d')
           SHA_SHORT=$(git rev-parse --short HEAD)
-          FULL_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_${{ matrix.goos }}-${{ matrix.goarch }}_${DATE}_${SHA_SHORT}"
-          FULL_EXE_NAME="${FULL_NAME}${{ matrix.goos == 'windows' && '.exe' || '' }}"
-          ARCHIVE_NAME="${{ env.APP_NAME }}_${{ matrix.goos }}-${{ matrix.goarch }}"
+          PLATFORM_ARCH="${{ matrix.goos }}-${{ matrix.goarch }}"
+          FULL_NAME_BASE="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_${PLATFORM_ARCH}_${DATE}_${SHA_SHORT}"
+          FULL_EXE_NAME="${FULL_NAME_BASE}${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          # Simplified archive name for the outer zip
+          ARCHIVE_NAME_NO_EXT="${PLATFORM_ARCH}"
+          FINAL_ARCHIVE_NAME_WITH_EXT="${ARCHIVE_NAME_NO_EXT}.zip"
+
           echo "full_exe_name=${FULL_EXE_NAME}" >> $GITHUB_OUTPUT
-          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+          echo "archive_name_no_ext=${ARCHIVE_NAME_NO_EXT}" >> $GITHUB_OUTPUT
+          echo "final_archive_name_with_ext=${FINAL_ARCHIVE_NAME_WITH_EXT}" >> $GITHUB_OUTPUT
+          echo "platform_arch=${PLATFORM_ARCH}" >> $GITHUB_OUTPUT
       - name: Build application
         env:
           GOOS: ${{ matrix.goos }}
@@ -50,16 +56,18 @@ jobs:
         run: |
           cd dist
           if [ "${{ matrix.goos }}" == "windows" ]; then
-            zip "${{ steps.vars.outputs.archive_name }}.zip" "${{ steps.vars.outputs.full_exe_name }}"
-            echo "asset_path=${{ steps.vars.outputs.archive_name }}.zip" >> $GITHUB_OUTPUT
+            zip "${{ steps.vars.outputs.final_archive_name_with_ext }}" "${{ steps.vars.outputs.full_exe_name }}"
           else
-            tar -czvf "${{ steps.vars.outputs.archive_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
-            echo "asset_path=${{ steps.vars.outputs.archive_name }}.tar.gz" >> $GITHUB_OUTPUT
+            # For non-Windows, first create a tar.gz of the executable
+            tar -czvf "${{ steps.vars.outputs.full_exe_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
+            # Then zip that tar.gz
+            zip "${{ steps.vars.outputs.final_archive_name_with_ext }}" "${{ steps.vars.outputs.full_exe_name }}.tar.gz"
           fi
+          echo "asset_path=${{ steps.vars.outputs.final_archive_name_with_ext }}" >> $GITHUB_OUTPUT
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.asset_path }}
+          name: ${{ steps.package.outputs.asset_path }} # This will be platform-arch.zip
           path: dist/${{ steps.package.outputs.asset_path }}
           retention-days: 7
 
@@ -76,12 +84,18 @@ jobs:
       - name: Set up build variables
         id: vars
         run: |
-          DATE=$(date -u -v+8H +'%Y%m%d')
+          DATE=$(date -u -v+8H +'%Y%m%d') # macOS specific date command
           SHA_SHORT=$(git rev-parse --short HEAD)
-          FULL_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_darwin-arm64_${DATE}_${SHA_SHORT}"
-          ARCHIVE_NAME="${{ env.APP_NAME }}_darwin-arm64"
-          echo "full_exe_name=${FULL_NAME}" >> $GITHUB_OUTPUT
-          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+          PLATFORM_ARCH="darwin-arm64"
+          FULL_NAME_BASE="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_${PLATFORM_ARCH}_${DATE}_${SHA_SHORT}"
+          FULL_EXE_NAME="${FULL_NAME_BASE}" # No .exe for macOS
+          ARCHIVE_NAME_NO_EXT="${PLATFORM_ARCH}"
+          FINAL_ARCHIVE_NAME_WITH_EXT="${ARCHIVE_NAME_NO_EXT}.zip"
+
+          echo "full_exe_name=${FULL_EXE_NAME}" >> $GITHUB_OUTPUT
+          echo "archive_name_no_ext=${ARCHIVE_NAME_NO_EXT}" >> $GITHUB_OUTPUT
+          echo "final_archive_name_with_ext=${FINAL_ARCHIVE_NAME_WITH_EXT}" >> $GITHUB_OUTPUT
+          echo "platform_arch=${PLATFORM_ARCH}" >> $GITHUB_OUTPUT
       - name: Build application
         env:
           GOOS: darwin
@@ -93,12 +107,15 @@ jobs:
         id: package
         run: |
           cd dist
-          tar -czvf "${{ steps.vars.outputs.archive_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
-          echo "asset_path=${{ steps.vars.outputs.archive_name }}.tar.gz" >> $GITHUB_OUTPUT
+          # First create a tar.gz of the executable
+          tar -czvf "${{ steps.vars.outputs.full_exe_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
+          # Then zip that tar.gz
+          zip "${{ steps.vars.outputs.final_archive_name_with_ext }}" "${{ steps.vars.outputs.full_exe_name }}.tar.gz"
+          echo "asset_path=${{ steps.vars.outputs.final_archive_name_with_ext }}" >> $GITHUB_OUTPUT
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.asset_path }}
+          name: ${{ steps.package.outputs.asset_path }} # This will be darwin-arm64.zip
           path: dist/${{ steps.package.outputs.asset_path }}
           retention-days: 7
 
@@ -125,10 +142,17 @@ jobs:
         run: |
           DATE=$(date -u -d '8 hours' +'%Y%m%d')
           SHA_SHORT=$(git rev-parse --short HEAD)
-          FULL_NAME="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_android-${{ matrix.goarch }}_${DATE}_${SHA_SHORT}"
-          ARCHIVE_NAME="${{ env.APP_NAME }}_android-${{ matrix.goarch }}"
-          echo "full_exe_name=${FULL_NAME}" >> $GITHUB_OUTPUT
-          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+          PLATFORM_ARCH="android-${{ matrix.goarch }}"
+          FULL_NAME_BASE="${{ env.APP_NAME }}_${{ env.VERSION_TAG }}_${PLATFORM_ARCH}_${DATE}_${SHA_SHORT}"
+          FULL_EXE_NAME="${FULL_NAME_BASE}" # No .exe for Android
+          ARCHIVE_NAME_NO_EXT="${PLATFORM_ARCH}"
+          FINAL_ARCHIVE_NAME_WITH_EXT="${ARCHIVE_NAME_NO_EXT}.zip"
+
+          echo "full_exe_name=${FULL_EXE_NAME}" >> $GITHUB_OUTPUT
+          echo "archive_name_no_ext=${ARCHIVE_NAME_NO_EXT}" >> $GITHUB_OUTPUT
+          echo "final_archive_name_with_ext=${FINAL_ARCHIVE_NAME_WITH_EXT}" >> $GITHUB_OUTPUT
+          echo "platform_arch=${PLATFORM_ARCH}" >> $GITHUB_OUTPUT
+
           if [ "${{ matrix.goarch }}" == "arm64" ]; then
             TOOLCHAIN_PREFIX="aarch64-linux-android"
           else
@@ -147,11 +171,14 @@ jobs:
         id: package
         run: |
           cd dist
-          tar -czvf "${{ steps.vars.outputs.archive_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
-          echo "asset_path=${{ steps.vars.outputs.archive_name }}.tar.gz" >> $GITHUB_OUTPUT
+          # First create a tar.gz of the executable
+          tar -czvf "${{ steps.vars.outputs.full_exe_name }}.tar.gz" "${{ steps.vars.outputs.full_exe_name }}"
+          # Then zip that tar.gz
+          zip "${{ steps.vars.outputs.final_archive_name_with_ext }}" "${{ steps.vars.outputs.full_exe_name }}.tar.gz"
+          echo "asset_path=${{ steps.vars.outputs.final_archive_name_with_ext }}" >> $GITHUB_OUTPUT
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.asset_path }}
+          name: ${{ steps.package.outputs.asset_path }} # This will be android-goarch.zip
           path: dist/${{ steps.package.outputs.asset_path }}
           retention-days: 7

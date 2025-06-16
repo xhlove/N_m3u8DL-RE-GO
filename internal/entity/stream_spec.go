@@ -105,7 +105,7 @@ func (s *StreamSpec) ToShortString() string {
 	if s.MediaType != nil {
 		switch *s.MediaType {
 		case MediaTypeAudio:
-			prefixStr = "[Audio]"
+			prefixStr = "[Aud]"
 			parts := []string{}
 			if s.GroupID != "" {
 				parts = append(parts, s.GroupID)
@@ -131,7 +131,7 @@ func (s *StreamSpec) ToShortString() string {
 			returnStr = strings.Join(parts, " | ")
 
 		case MediaTypeSubtitles:
-			prefixStr = "[Subtitle]"
+			prefixStr = "[Sub]"
 			parts := []string{}
 			if s.GroupID != "" {
 				parts = append(parts, s.GroupID)
@@ -151,7 +151,7 @@ func (s *StreamSpec) ToShortString() string {
 			returnStr = strings.Join(parts, " | ")
 
 		default:
-			prefixStr = "[Video]"
+			prefixStr = "[Vid]"
 			parts := []string{}
 			if s.Resolution != "" {
 				parts = append(parts, s.Resolution)

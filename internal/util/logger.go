@@ -44,6 +44,7 @@ type LogManager struct {
 	IsWriteFile bool
 	LogFilePath string
 	logMutex    sync.RWMutex
+	isUIActive  bool
 }
 
 // Logger 全局日志实例
@@ -54,6 +55,11 @@ func init() {
 		Level:       LogLevelInfo,
 		IsWriteFile: true,
 	}
+}
+
+// SetUIActive a flag to redirect logs to the UIManager
+func (l *LogManager) SetUIActive(active bool) {
+	l.isUIActive = active
 }
 
 // SetLogLevel 设置日志级别
@@ -67,7 +73,6 @@ func (l *LogManager) InitLogFile() error {
 		return nil
 	}
 
-	// 创建日志目录
 	var logDir string
 	if l.LogFilePath != "" {
 		logDir = filepath.Dir(l.LogFilePath)
@@ -84,12 +89,9 @@ func (l *LogManager) InitLogFile() error {
 		return fmt.Errorf("创建日志目录失败: %w", err)
 	}
 
-	// 生成日志文件名
 	if l.LogFilePath == "" {
 		now := time.Now()
 		l.LogFilePath = filepath.Join(logDir, now.Format("2006-01-02_15-04-05-000")+".log")
-
-		// 如果文件已存在，添加序号
 		index := 1
 		baseFileName := strings.TrimSuffix(l.LogFilePath, ".log")
 		for {
@@ -101,7 +103,6 @@ func (l *LogManager) InitLogFile() error {
 		}
 	}
 
-	// 写入初始化信息
 	now := time.Now()
 	initContent := fmt.Sprintf("LOG %s\n", now.Format("2006/01/02"))
 	initContent += fmt.Sprintf("Save Path: %s\n", filepath.Dir(l.LogFilePath))
@@ -111,32 +112,25 @@ func (l *LogManager) InitLogFile() error {
 	return os.WriteFile(l.LogFilePath, []byte(initContent), 0644)
 }
 
-// writeToFile 写入日志到文件
 func (l *LogManager) writeToFile(content string) {
 	if !l.IsWriteFile || l.LogFilePath == "" {
 		return
 	}
-
 	l.logMutex.Lock()
 	defer l.logMutex.Unlock()
-
 	file, err := os.OpenFile(l.LogFilePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return
 	}
 	defer file.Close()
-
-	// 移除ANSI颜色代码
 	plainContent := Console.removeMarkup(content)
 	file.WriteString(plainContent + "\n")
 }
 
-// getCurrentTime 获取当前时间字符串
 func getCurrentTime() string {
 	return time.Now().Format("15:04:05.000")
 }
 
-// replaceVars 替换变量
 func replaceVars(format string, args ...interface{}) string {
 	if len(args) == 0 {
 		return format
@@ -144,16 +138,19 @@ func replaceVars(format string, args ...interface{}) string {
 	return fmt.Sprintf(format, args...)
 }
 
-// handleLog 处理日志输出
 func (l *LogManager) handleLog(markup, plain string) {
-	// 控制台输出
-	if markup != "" {
-		Console.MarkupLine(markup)
+	if l.isUIActive {
+		// The new UI.Log handles printing and redrawing atomically.
+		// We pass the markup directly.
+		UI.Log(markup)
 	} else {
-		fmt.Println(plain)
+		if markup != "" {
+			Console.MarkupLine(markup)
+		} else {
+			fmt.Println(plain)
+		}
 	}
 
-	// 文件输出
 	content := markup
 	if content == "" {
 		content = plain
@@ -166,7 +163,6 @@ func (l *LogManager) Debug(format string, args ...interface{}) {
 	if l.Level > LogLevelDebug {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	plain := fmt.Sprintf("%s DEBUG: %s", timeStr, message)
@@ -179,7 +175,6 @@ func (l *LogManager) DebugMarkUp(format string, args ...interface{}) {
 	if l.Level > LogLevelDebug {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	markup := fmt.Sprintf("%s [underline grey]DEBUG[/]: %s", timeStr, message)
@@ -191,7 +186,6 @@ func (l *LogManager) Info(format string, args ...interface{}) {
 	if l.Level > LogLevelInfo {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	plain := fmt.Sprintf("%s INFO : %s", timeStr, message)
@@ -204,7 +198,6 @@ func (l *LogManager) InfoMarkUp(format string, args ...interface{}) {
 	if l.Level > LogLevelInfo {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	markup := fmt.Sprintf("%s [underline #548c26]INFO[/] : %s", timeStr, message)
@@ -216,7 +209,6 @@ func (l *LogManager) Warn(format string, args ...interface{}) {
 	if l.Level > LogLevelWarn {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	plain := fmt.Sprintf("%s WARN : %s", timeStr, message)
@@ -229,7 +221,6 @@ func (l *LogManager) WarnMarkUp(format string, args ...interface{}) {
 	if l.Level > LogLevelWarn {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	markup := fmt.Sprintf("%s [underline #a89022]WARN[/] : %s", timeStr, message)
@@ -241,7 +232,6 @@ func (l *LogManager) Error(format string, args ...interface{}) {
 	if l.Level > LogLevelError {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	plain := fmt.Sprintf("%s ERROR: %s", timeStr, message)
@@ -254,7 +244,6 @@ func (l *LogManager) ErrorMarkUp(format string, args ...interface{}) {
 	if l.Level > LogLevelError {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	markup := fmt.Sprintf("%s [underline red1]ERROR[/]: %s", timeStr, message)
@@ -266,7 +255,6 @@ func (l *LogManager) Extra(format string, args ...interface{}) {
 	if !l.IsWriteFile || l.LogFilePath == "" {
 		return
 	}
-
 	message := replaceVars(format, args...)
 	timeStr := getCurrentTime()
 	content := fmt.Sprintf("%s EXTRA: %s", timeStr, message)

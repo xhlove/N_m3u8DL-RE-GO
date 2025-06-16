@@ -484,7 +484,7 @@ func MuxInputsByMkvmerge(mkvmergePath string, files []*OutputFile, outputPath st
 // invokeFFmpeg 执行FFmpeg命令（修复版本 - 增强日志和错误报告）
 func invokeFFmpeg(binary string, args []string, workingDir string) error {
 	// 将要执行的命令提升到INFO级别，确保可见
-	Logger.Info(fmt.Sprintf("Executing FFmpeg: %s %s", binary, strings.Join(args, " ")))
+	Logger.Debug(fmt.Sprintf("Executing FFmpeg: %s %s", binary, strings.Join(args, " ")))
 
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = workingDir

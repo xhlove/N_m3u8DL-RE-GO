@@ -33,8 +33,7 @@ var rootCmd = &cobra.Command{
 
 		err := runDownload(cmd, args[0])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "下载失败: %s\n", err.Error())
-			os.Exit(1)
+			// Error is already logged by the manager
 		}
 	},
 }
@@ -119,7 +118,7 @@ func runDownload(cmd *cobra.Command, url string) error {
 	customHlsKey, _ := cmd.Flags().GetString("custom-hls-key")
 	customHlsIv, _ := cmd.Flags().GetString("custom-hls-iv")
 
-	// 复用和后处理参数
+	// 混流和后处理参数
 	muxFormat, _ := cmd.Flags().GetString("mux-format")
 	muxAfterDone, _ := cmd.Flags().GetString("mux-after-done")
 	muxImports, _ := cmd.Flags().GetStringSlice("mux-import")
@@ -181,7 +180,9 @@ func runDownload(cmd *cobra.Command, url string) error {
 	_ = customHlsIv
 	// 解析混流参数
 	var muxOptions *entity.MuxOptions
-	if muxAfterDone != "" {
+	if cmd.Flags().Changed("mux-after-done") {
+		// 如果用户提供了 -M 标志，即使其值为空字符串，也尝试解析
+		// parseMuxAfterDone 函数应该能够处理空字符串并返回默认值或错误
 		var err error
 		muxOptions, err = parseMuxAfterDone(muxAfterDone)
 		if err != nil {
@@ -294,8 +295,6 @@ func runDownload(cmd *cobra.Command, url string) error {
 		util.Logger.InfoMarkUp(stream.ToString())
 	}
 
-	// 这个变量已经在上面声明了，不需要再次声明
-
 	var filteredStreams []*entity.StreamSpec
 
 	// 判断是否有明确的选择条件
@@ -387,7 +386,7 @@ func runDownload(cmd *cobra.Command, url string) error {
 		RetryCount:             retryCount,
 		Headers:                headers,
 		CheckLength:            true,
-		DeleteAfterDone:        true,
+		DeleteAfterDone:        deleteAfterDone,
 		BinaryMerge:            binaryMerge,
 		SkipMerge:              false,
 		ConcurrentDownload:     threadCount > 1,
@@ -410,12 +409,11 @@ func runDownload(cmd *cobra.Command, url string) error {
 	downloadManager := downloader.NewDownloadManager(managerConfig, filteredStreams)
 
 	// 开始下载
-	err = downloadManager.StartDownloadAsync()
+	err = downloadManager.StartDownload()
 	if err != nil {
 		return fmt.Errorf("下载失败: %w", err)
 	}
 
-	util.Logger.Info("所有下载任务完成")
 	return nil
 }
 
@@ -482,10 +480,10 @@ func init() {
 	rootCmd.PersistentFlags().String("custom-hls-key", "", "自定义HLS密钥")
 	rootCmd.PersistentFlags().String("custom-hls-iv", "", "自定义HLS初始向量")
 
-	// 复用和后处理
-	rootCmd.PersistentFlags().String("mux-format", "mp4", "复用格式")
-	rootCmd.PersistentFlags().StringP("mux-after-done", "M", "", "完成后复用参数")
-	rootCmd.PersistentFlags().StringSlice("mux-import", []string{}, "复用导入文件")
+	// 混流和后处理
+	rootCmd.PersistentFlags().String("mux-format", "mp4", "混流格式")
+	rootCmd.PersistentFlags().StringP("mux-after-done", "M", "", "完成后混流参数")
+	rootCmd.PersistentFlags().StringSlice("mux-import", []string{}, "混流导入文件")
 	rootCmd.PersistentFlags().String("subtitle-format", "SRT", "字幕格式")
 	rootCmd.PersistentFlags().Bool("auto-subtitle-fix", true, "自动修复字幕")
 
@@ -501,7 +499,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("live-perform-as-vod", false, "直播当作点播处理")
 	rootCmd.PersistentFlags().Bool("live-real-time-merge", false, "直播实时合并")
 	rootCmd.PersistentFlags().Bool("live-keep-segments", true, "直播保留分片")
-	rootCmd.PersistentFlags().Bool("live-pipe-mux", false, "直播管道复用")
+	rootCmd.PersistentFlags().Bool("live-pipe-mux", false, "直播管道混流")
 	rootCmd.PersistentFlags().String("live-record-limit", "", "直播录制时长限制")
 	rootCmd.PersistentFlags().String("live-wait-time", "", "直播等待时间")
 	rootCmd.PersistentFlags().Int("live-take-count", 16, "直播分片获取数量")

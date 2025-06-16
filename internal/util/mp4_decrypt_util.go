@@ -46,9 +46,19 @@ func SearchKeyFromFile(keyTextFile, kid string) (string, error) {
 }
 
 // Decrypt invokes an external decryption tool to decrypt a file.
-func Decrypt(decryptEngine, decryptionBinaryPath string, keys []string, encFile, decFile, kid string, isMultiDRM bool) (bool, error) {
+func Decrypt(decryptEngine, decryptionBinaryPath string, keys []string, encFile, decFile, kid string, task *Task) (bool, error) {
+	if decryptEngine != "MP4DECRYPT" {
+		// For now, only MP4DECRYPT is supported for CENC.
+		// AES-128 is handled internally.
+		return false, fmt.Errorf("unsupported decrypt engine for this function: %s", decryptEngine)
+	}
+
 	if _, err := os.Stat(decryptionBinaryPath); os.IsNotExist(err) {
-		Logger.Error("解密程序 %s 不存在", decryptionBinaryPath)
+		err = fmt.Errorf("解密程序 %s 不存在", decryptionBinaryPath)
+		if task != nil {
+			task.SetError(err)
+		}
+		Logger.Error(err.Error())
 		return false, err
 	}
 
@@ -61,7 +71,11 @@ func Decrypt(decryptEngine, decryptionBinaryPath string, keys []string, encFile,
 		args = append(args, encFile, decFile)
 	// Add other engines like SHAKA_PACKAGER later
 	default:
-		return false, fmt.Errorf("不支持的解密引擎: %s", decryptEngine)
+		err := fmt.Errorf("不支持的解密引擎: %s", decryptEngine)
+		if task != nil {
+			task.SetError(err)
+		}
+		return false, err
 	}
 
 	cmd := exec.Command(decryptionBinaryPath, args...)
@@ -69,10 +83,17 @@ func Decrypt(decryptEngine, decryptionBinaryPath string, keys []string, encFile,
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		err = fmt.Errorf("解密命令执行失败: %w, output: %s", err, string(output))
+		if task != nil {
+			task.SetError(err)
+		}
 		Logger.Error("解密失败: %s", string(output))
-		return false, fmt.Errorf("解密命令执行失败: %w", err)
+		return false, err
 	}
 
+	if task != nil {
+		task.Increment(1) // Increment the overall task by 1 for each successful segment decryption
+	}
 	Logger.Info("解密成功: %s", decFile)
 	return true, nil
 }

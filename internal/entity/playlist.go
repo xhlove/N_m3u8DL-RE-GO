@@ -8,6 +8,7 @@ type Playlist struct {
 	TargetDuration    *float64      `json:"targetDuration,omitempty"`
 	MediaInit         *MediaSegment `json:"mediaInit,omitempty"`
 	MediaParts        []*MediaPart  `json:"mediaParts"`
+	TotalBytes        int64         `json:"totalBytes"`
 }
 
 // NewPlaylist 创建新的播放列表
@@ -81,4 +82,16 @@ func (p *Playlist) GetEncryptMethods() []EncryptMethod {
 	}
 
 	return methods
+}
+
+// GetFirstEncryptedSegment returns the first segment that is marked as encrypted.
+func (p *Playlist) GetFirstEncryptedSegment() *MediaSegment {
+	for _, part := range p.MediaParts {
+		for _, segment := range part.MediaSegments {
+			if segment.IsEncrypted {
+				return segment
+			}
+		}
+	}
+	return nil
 }

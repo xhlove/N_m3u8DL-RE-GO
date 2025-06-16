@@ -204,6 +204,7 @@ func (p *HLSParser) parseMediaPlaylist(lines []string) ([]*entity.StreamSpec, er
 	var segIndex int64 = 0
 	var isEndlist bool = false
 	var hasAd bool = false
+	var totalBytes int64 = 0
 
 	// 扫描广告相关标记
 	var isAd bool = false
@@ -337,6 +338,9 @@ func (p *HLSParser) parseMediaPlaylist(lines []string) ([]*entity.StreamSpec, er
 				} else {
 					util.Logger.Debug(fmt.Sprintf("添加分段到mediaPart，当前分段数: %d", len(mediaPart.MediaSegments)))
 					mediaPart.AddSegment(currentSegment)
+					if currentSegment.ExpectLength != nil {
+						totalBytes += *currentSegment.ExpectLength
+					}
 				}
 				currentSegment = nil
 			}
@@ -385,6 +389,7 @@ func (p *HLSParser) parseMediaPlaylist(lines []string) ([]*entity.StreamSpec, er
 	}
 
 	stream.Playlist = playlist
+	playlist.TotalBytes = totalBytes
 
 	// 添加调试信息
 	totalSegments := len(playlist.GetAllSegments())
